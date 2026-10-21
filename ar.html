@@ -76,6 +76,7 @@
     const TEST_VIDEO = params.get('video');
 
     const BARCODE_LIB = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/es/ponyfill.js';
+    const ZXING_WASM = 'vendor/zxing_reader.wasm'; // zxing-wasm@3.1.3 reader, the version barcode-detector@3.2.2 expects
     const MEDIAPIPE_VER = '0.10.35';
     const MEDIAPIPE_LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VER}/vision_bundle.mjs`;
     const MEDIAPIPE_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VER}/wasm`;
@@ -115,11 +116,24 @@
 
     function log(type, msg) {
       const t = ((performance.now() - t0) / 1000).toFixed(2).padStart(7);
-      events.unshift({ type, text: `${t}s  ${msg}` });
+      debugDirty = true;
+      // collapse repeats of the same message into one line with a counter
+      if (events[0] && events[0].type === type && events[0].msg === msg) {
+        events[0].count++;
+        events[0].text = `${t}s  ${msg}  ×${events[0].count}`;
+        return;
+      }
+      events.unshift({ type, msg, count: 1, text: `${t}s  ${msg}` });
       events.length = Math.min(events.length, 80);
       console.log(`[ar ${type}] ${msg}`);
-      debugDirty = true;
     }
+
+    // mirror console.error into the panel, e.g. the real cause behind library errors
+    const consoleError = console.error.bind(console);
+    console.error = (...args) => {
+      consoleError(...args);
+      log('err', 'console.error: ' + args.map(a => (a instanceof Error ? `${a.name}: ${a.message}` : String(a))).join(' '));
+    };
 
     function renderDebug() {
       if (!debugEl.classList.contains('open') || !debugDirty) return;
@@ -240,7 +254,19 @@
     async function ensureBarcodeDetector() {
       if (barcodeDetector) return;
       setStatus('Loading barcode detector…');
-      const { BarcodeDetector } = await import(BARCODE_LIB);
+      const { BarcodeDetector, prepareZXingModule } = await import(BARCODE_LIB);
+      // Load the decoder wasm from this site instead of the library's default CDN (fastly.jsdelivr.net),
+      // which may be unreachable on some networks. Loading it up front reports a failure once, clearly.
+      try {
+        await prepareZXingModule({
+          overrides: {
+            locateFile: (path, prefix) => (path.endsWith('.wasm') ? new URL(ZXING_WASM, location.href).href : prefix + path),
+          },
+          fireImmediately: true,
+        });
+      } catch (err) {
+        throw new Error(`barcode engine failed to load (${ZXING_WASM}): ${err.message || err}`);
+      }
       barcodeDetector = new BarcodeDetector({
         formats: ['qr_code', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'data_matrix'],
       });
@@ -337,7 +363,7 @@
       } catch (err) {
         setStatus('Detection error: ' + err.message);
         log('err', 'detection error: ' + err.message);
-        console.error(err);
+        consoleError(err); // already in the panel, skip the mirror
       } finally {
         busy = false;
       }
