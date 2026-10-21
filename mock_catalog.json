@@ -1,0 +1,12 @@
+{
+  "4891199227493": { "name": "GP Alkaline AAA x4", "price": 2.49, "currency": "EUR" },
+  "4006381333931": { "name": "Stabilo pen", "price": 1.49, "currency": "EUR" },
+  "5449000000996": { "name": "Coca-Cola 0.33l", "price": 0.99, "currency": "EUR" },
+  "bottle": { "name": "Water bottle", "price": 0.79, "currency": "EUR" },
+  "cup": { "name": "Coffee mug", "price": 6.50, "currency": "EUR" },
+  "cell phone": { "name": "Smartphone", "price": 499, "currency": "EUR" },
+  "book": { "name": "Book", "price": 14.90, "currency": "EUR" },
+  "keyboard": { "name": "Keyboard", "price": 39.00, "currency": "EUR" },
+  "mouse": { "name": "Mouse", "price": 19.00, "currency": "EUR" },
+  "laptop": { "name": "Laptop", "price": 899, "currency": "EUR" }
+}

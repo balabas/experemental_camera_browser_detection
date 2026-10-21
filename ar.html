@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>AR Price Tags</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+    #stage { position: fixed; inset: 0; }
+    video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+    video { object-fit: cover; }
+    #bar {
+      position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+      display: flex; gap: 8px; align-items: center; background: linear-gradient(transparent, rgba(0,0,0,.8));
+    }
+    button { font-size: 15px; padding: 10px 14px; border-radius: 999px; border: 0; background: #333; color: #fff; }
+    button.active { background: #2f7cf6; }
+    #debugBtn { margin-left: auto; }
+    #status { position: fixed; top: 0; left: 0; right: 0; padding: calc(8px + env(safe-area-inset-top)) 16px 8px;
+      font-size: 13px; background: linear-gradient(rgba(0,0,0,.7), transparent); }
+    #startScreen { position: fixed; inset: 0; display: grid; place-items: center; background: #111; text-align: center; padding: 16px; }
+    #startScreen button { font-size: 18px; padding: 14px 24px; background: #2f7cf6; margin: 6px; }
+    #startScreen button.secondary { background: #333; }
+
+    #debug {
+      position: fixed; top: calc(34px + env(safe-area-inset-top)); left: 8px; right: 8px; max-height: 48vh; overflow: auto;
+      background: rgba(0,0,0,.75); border-radius: 8px; padding: 8px; font: 11px/1.4 ui-monospace, Menlo, monospace;
+      display: none;
+    }
+    #debug.open { display: block; }
+    #debug table { border-collapse: collapse; width: 100%; margin: 4px 0 6px; }
+    #debug td, #debug th { padding: 1px 4px; text-align: left; white-space: nowrap; }
+    #debug th { color: #999; font-weight: normal; }
+    #debugLog div { white-space: pre-wrap; word-break: break-all; }
+    .ev-appear { color: #8fd3ff; } .ev-lost { color: #888; } .ev-req { color: #ffd166; }
+    .ev-res { color: #7ee787; } .ev-err { color: #ff7b72; } .ev-info { color: #ccc; }
+    .st-pending { color: #ffd166; } .st-ok { color: #7ee787; } .st-notfound { color: #ffa657; } .st-error { color: #ff7b72; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div id="status">Idle</div>
+  <div id="debug">
+    <div id="debugStats"></div>
+    <table><thead><tr><th>key</th><th>state</th><th>ms</th><th>hits</th><th>result</th></tr></thead><tbody id="debugKeys"></tbody></table>
+    <div id="debugLog"></div>
+  </div>
+  <div id="bar">
+    <button id="modeCodes" class="active">Codes</button>
+    <button id="modeObjects">Objects</button>
+    <button id="debugBtn">Debug</button>
+  </div>
+  <div id="startScreen">
+    <div>
+      <h2>AR Price Tags</h2>
+      <p>Point the camera at a barcode / QR code, or switch to Objects mode.</p>
+      <button id="start">Start camera</button><br>
+      <button id="startSample" class="secondary" hidden>Play test video</button><br>
+      <button id="pickVideo" class="secondary">Use video file…</button>
+      <input id="videoFile" type="file" accept="video/*" hidden>
+    </div>
+  </div>
+
+  <script type="module">
+    // ---------- Config ----------
+    // URL parameters:
+    //   ?api=/api/price/      price API base; the code is appended (GET <api><code>), response JSON: { name, price, currency }
+    //                         without it, an in-page mock is used (prices from mock_catalog.json, no per-code requests)
+    //   ?video=path.mp4       offer a looped test video instead of the camera
+    //   ?debug=1              open the debug panel on start
+    const params = new URLSearchParams(location.search);
+    const PRICE_API = params.get('api') || '';
+    const TEST_VIDEO = params.get('video');
+
+    const BARCODE_LIB = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/es/ponyfill.js';
+    const MEDIAPIPE_VER = '0.10.35';
+    const MEDIAPIPE_LIB = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VER}/vision_bundle.mjs`;
+    const MEDIAPIPE_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VER}/wasm`;
+    const OBJECT_MODEL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite';
+
+    const DETECT_INTERVAL_MS = 66;   // ~15 detections per second
+    const TRACK_TIMEOUT_MS = 700;    // keep a tag this long after losing the target
+    const SMOOTHING = 0.35;          // 0..1, higher = snappier, lower = smoother
+    const RETRY_MS = 3000;           // retry a failed lookup after this long
+    const MOCK_DELAY_MS = 300;       // simulated latency of the in-page mock
+
+    // ---------- DOM ----------
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const btnCodes = document.getElementById('modeCodes');
+    const btnObjects = document.getElementById('modeObjects');
+    const debugEl = document.getElementById('debug');
+
+    let mode = 'codes';
+    let barcodeDetector = null;
+    let objectDetector = null;
+    let busy = false;
+    let lastDetect = 0;
+    let nextObjectId = 1;
+    const tracks = new Map();   // track key -> { key, lookup, label, pts, target, lastSeen }
+    const lookups = new Map();  // lookup key -> { state: pending|ok|notfound|error, value, error, sentAt, ms, hits }
+
+    const setStatus = msg => { statusEl.textContent = msg; };
+
+    // ---------- Debug log ----------
+    const t0 = performance.now();
+    const events = [];
+    const stats = { detections: 0, detectMs: 0, sent: 0, ok: 0, failed: 0, fps: 0 };
+    let debugDirty = true;
+
+    function log(type, msg) {
+      const t = ((performance.now() - t0) / 1000).toFixed(2).padStart(7);
+      events.unshift({ type, text: `${t}s  ${msg}` });
+      events.length = Math.min(events.length, 80);
+      console.log(`[ar ${type}] ${msg}`);
+      debugDirty = true;
+    }
+
+    function renderDebug() {
+      if (!debugEl.classList.contains('open') || !debugDirty) return;
+      debugDirty = false;
+      document.getElementById('debugStats').textContent =
+        `api: ${PRICE_API ? 'GET ' + PRICE_API + '<code>' : 'in-page mock'} | detect: ${stats.fps.toFixed(1)}/s, ` +
+        `${stats.detectMs.toFixed(0)} ms | tracks: ${tracks.size} | requests: ${stats.sent} sent, ${stats.ok} ok, ${stats.failed} failed`;
+      document.getElementById('debugKeys').innerHTML = [...lookups.entries()].map(([k, l]) => `<tr>
+        <td>${esc(k.length > 18 ? k.slice(0, 17) + '…' : k)}</td>
+        <td class="st-${l.state}">${l.state}</td>
+        <td>${l.ms != null ? l.ms.toFixed(0) : ''}</td>
+        <td>${l.hits}</td>
+        <td>${esc(l.value ? `${formatPrice(l.value)} ${l.value.name}` : l.error || '')}</td></tr>`).join('');
+      document.getElementById('debugLog').innerHTML =
+        events.map(e => `<div class="ev-${e.type}">${esc(e.text)}</div>`).join('');
+    }
+    setInterval(renderDebug, 250);
+    setInterval(() => { debugDirty = true; }, 1000); // refresh stats even without new events
+
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+    // ---------- Price lookup ----------
+    // Called on every detection; only the first call for a key sends a request, later calls are cache hits.
+    function lookupPrice(key) {
+      let l = lookups.get(key);
+      if (l) { l.hits++; return l; }
+      l = { state: 'pending', hits: 1, sentAt: performance.now() };
+      lookups.set(key, l);
+      stats.sent++;
+      const url = PRICE_API && PRICE_API + encodeURIComponent(key);
+      log('req', `→ ${url ? 'GET ' + url : 'mock lookup'}  [${key}]`);
+
+      (url ? fetchJson(url) : mockLookup(key))
+        .then(value => {
+          l.ms = performance.now() - l.sentAt;
+          if (value) {
+            l.state = 'ok'; l.value = value; stats.ok++;
+            log('res', `← ${l.ms.toFixed(0)} ms  ${key}: ${formatPrice(value)} ${value.name}`);
+          } else {
+            l.state = 'notfound'; l.error = 'not in catalog'; stats.ok++;
+            log('res', `← ${l.ms.toFixed(0)} ms  ${key}: not found`);
+          }
+        })
+        .catch(err => {
+          l.ms = performance.now() - l.sentAt;
+          l.state = 'error'; l.error = err.message; stats.failed++;
+          log('err', `✕ ${l.ms.toFixed(0)} ms  ${key}: ${err.message} (retry in ${RETRY_MS / 1000}s)`);
+          setTimeout(() => lookups.delete(key), RETRY_MS);
+        })
+        .finally(() => { debugDirty = true; });
+      return l;
+    }
+
+    async function fetchJson(url) {
+      const r = await fetch(url);
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    }
+
+    let mockCatalog = null;
+    async function mockLookup(key) {
+      mockCatalog ??= fetch('mock_catalog.json').then(r => r.json()).catch(() => ({}));
+      const catalog = await mockCatalog;
+      await new Promise(r => setTimeout(r, MOCK_DELAY_MS));
+      if (catalog[key]) return catalog[key];
+      // Unknown key: deterministic fake price so every code shows something
+      let h = 0;
+      for (const ch of key) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+      return { name: key.length > 24 ? key.slice(0, 22) + '…' : key, price: (h % 5000) / 100 + 0.99, currency: 'EUR', demo: true };
+    }
+
+    // ---------- Video source ----------
+    async function startCamera() {
+      if (!window.isSecureContext) {
+        setStatus('Needs HTTPS (or localhost) for camera access.');
+        return;
+      }
+      video.srcObject = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false,
+      });
+      log('info', 'source: camera');
+      await startPlayback();
+    }
+
+    async function startFile(src, name) {
+      video.src = src;
+      video.loop = true;
+      log('info', `source: video file ${name}`);
+      await startPlayback();
+    }
+
+    async function startPlayback() {
+      await video.play();
+      log('info', `video ${video.videoWidth}x${video.videoHeight}`);
+      resizeCanvas();
+      requestAnimationFrame(loop);
+    }
+
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvas.clientWidth * dpr;
+      canvas.height = canvas.clientHeight * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // Map video pixel coords -> screen coords, accounting for object-fit: cover cropping
+    function videoToScreen(x, y) {
+      const cw = canvas.clientWidth, ch = canvas.clientHeight;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const s = Math.max(cw / vw, ch / vh);
+      return { x: x * s + (cw - vw * s) / 2, y: y * s + (ch - vh * s) / 2 };
+    }
+
+    // ---------- Detectors ----------
+    async function ensureBarcodeDetector() {
+      if (barcodeDetector) return;
+      setStatus('Loading barcode detector…');
+      const { BarcodeDetector } = await import(BARCODE_LIB);
+      barcodeDetector = new BarcodeDetector({
+        formats: ['qr_code', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'data_matrix'],
+      });
+      setStatus('Scanning for codes…');
+      log('info', 'barcode detector ready');
+    }
+
+    async function ensureObjectDetector() {
+      if (objectDetector) return;
+      setStatus('Loading object model…');
+      const { FilesetResolver, ObjectDetector } = await import(MEDIAPIPE_LIB);
+      const fileset = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM);
+      objectDetector = await ObjectDetector.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: OBJECT_MODEL, delegate: 'GPU' },
+        runningMode: 'VIDEO',
+        scoreThreshold: 0.45,
+        maxResults: 8,
+      });
+      setStatus('Detecting objects…');
+      log('info', 'object detector ready');
+    }
+
+    // Each detection -> { key, lookup, label, pts: [4 corner points in video coords] }
+    async function detectCodes() {
+      const codes = await barcodeDetector.detect(video);
+      return codes.map(c => ({
+        key: 'code:' + c.rawValue,
+        lookup: c.rawValue,
+        label: c.format,
+        pts: c.cornerPoints.map(p => ({ x: p.x, y: p.y })),
+      }));
+    }
+
+    function detectObjects(now) {
+      const res = objectDetector.detectForVideo(video, now);
+      const found = res.detections.map(d => {
+        const b = d.boundingBox;
+        const cls = d.categories[0].categoryName;
+        return {
+          cls,
+          lookup: cls,
+          label: `${cls} ${(d.categories[0].score * 100).toFixed(0)}%`,
+          pts: [
+            { x: b.originX, y: b.originY },
+            { x: b.originX + b.width, y: b.originY },
+            { x: b.originX + b.width, y: b.originY + b.height },
+            { x: b.originX, y: b.originY + b.height },
+          ],
+        };
+      });
+      // Objects have no unique ID, so match each one to the nearest existing track of the same class
+      const free = [...tracks.values()].filter(t => t.cls);
+      for (const f of found) {
+        const c = center(f.pts);
+        let best = null, bestDist = 0.25 * Math.max(video.videoWidth, video.videoHeight);
+        for (const t of free) {
+          if (t.cls !== f.cls) continue;
+          const d = Math.hypot(center(t.target).x - c.x, center(t.target).y - c.y);
+          if (d < bestDist) { best = t; bestDist = d; }
+        }
+        if (best) free.splice(free.indexOf(best), 1);
+        f.key = best ? best.key : `obj:${nextObjectId++}`;
+      }
+      return found;
+    }
+
+    const center = pts => ({
+      x: pts.reduce((s, p) => s + p.x, 0) / pts.length,
+      y: pts.reduce((s, p) => s + p.y, 0) / pts.length,
+    });
+
+    // ---------- Main loop ----------
+    async function runDetection(now) {
+      busy = true;
+      const startedMode = mode;
+      const start = performance.now();
+      try {
+        const dets = startedMode === 'codes'
+          ? (await ensureBarcodeDetector(), await detectCodes())
+          : (await ensureObjectDetector(), detectObjects(now));
+        if (mode !== startedMode) return; // mode switched while detecting
+        stats.detections++;
+        stats.detectMs = performance.now() - start;
+        for (const d of dets) {
+          const t = tracks.get(d.key);
+          if (t) {
+            t.target = d.pts; t.label = d.label; t.lastSeen = now;
+          } else {
+            tracks.set(d.key, { ...d, target: d.pts, pts: d.pts.map(p => ({ ...p })), lastSeen: now });
+            log('appear', `+ ${d.label}  ${d.lookup}`);
+          }
+          lookupPrice(d.lookup);
+        }
+      } catch (err) {
+        setStatus('Detection error: ' + err.message);
+        log('err', 'detection error: ' + err.message);
+        console.error(err);
+      } finally {
+        busy = false;
+      }
+    }
+
+    let fpsCount = 0, fpsStart = 0;
+    function loop(now) {
+      if (!busy && video.readyState >= 2 && now - lastDetect > DETECT_INTERVAL_MS) {
+        lastDetect = now;
+        runDetection(now);
+        fpsCount++;
+      }
+      if (now - fpsStart > 1000) { stats.fps = fpsCount * 1000 / (now - fpsStart); fpsCount = 0; fpsStart = now; }
+      draw(now);
+      requestAnimationFrame(loop);
+    }
+
+    // ---------- Drawing ----------
+    function draw(now) {
+      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      for (const [key, t] of tracks) {
+        const age = now - t.lastSeen;
+        if (age > TRACK_TIMEOUT_MS) {
+          tracks.delete(key);
+          log('lost', `- ${t.lookup}`);
+          continue;
+        }
+        // smooth corner points toward latest detection
+        t.pts.forEach((p, i) => {
+          p.x += (t.target[i].x - p.x) * SMOOTHING;
+          p.y += (t.target[i].y - p.y) * SMOOTHING;
+        });
+        const alpha = age < 200 ? 1 : 1 - (age - 200) / (TRACK_TIMEOUT_MS - 200);
+        drawTrack(t, Math.max(0, alpha));
+      }
+    }
+
+    function drawTrack(t, alpha) {
+      const s = t.pts.map(p => videoToScreen(p.x, p.y));
+      const l = lookups.get(t.lookup);
+      const debug = debugEl.classList.contains('open');
+      ctx.globalAlpha = alpha;
+
+      // outline
+      ctx.beginPath();
+      s.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+      ctx.closePath();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#2f7cf6';
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(47,124,246,0.12)';
+      ctx.fill();
+
+      // price tag anchored above the top-most point
+      const top = s.reduce((a, b) => (b.y < a.y ? b : a));
+      const cx = s.reduce((sum, p) => sum + p.x, 0) / 4;
+      let line1, line2, bg = '#ffffff', fg = '#111';
+      if (!l || l.state === 'pending') {
+        line1 = '⏳ requesting…'; line2 = t.lookup; bg = '#ffd166';
+      } else if (l.state === 'ok') {
+        line1 = formatPrice(l.value); line2 = l.value.name;
+        if (l.value.demo) { bg = '#b36b00'; fg = '#fff'; }
+      } else {
+        line1 = l.state === 'notfound' ? 'Not in catalog' : 'Lookup failed'; line2 = l.error; bg = '#ff7b72';
+      }
+      if (debug) line2 += `  ·  ${t.label}${l?.ms != null ? `  ·  ${l.ms.toFixed(0)} ms` : ''}`;
+
+      ctx.font = 'bold 22px system-ui, sans-serif';
+      const w1 = ctx.measureText(line1).width;
+      ctx.font = '13px system-ui, sans-serif';
+      const w2 = ctx.measureText(line2).width;
+      const w = Math.min(Math.max(w1, w2) + 24, canvas.clientWidth - 16), h = 56;
+      const x = Math.min(Math.max(cx - w / 2, 8), canvas.clientWidth - w - 8);
+      const y = Math.max(top.y - h - 14, 8);
+
+      // pointer line from tag to target
+      const lx = Math.min(Math.max(cx, x + 12), x + w - 12);
+      ctx.beginPath();
+      ctx.moveTo(lx, y + h);
+      ctx.lineTo(lx, top.y);
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.fillStyle = bg;
+      roundRect(x, y, w, h, 10);
+      ctx.fill();
+
+      ctx.fillStyle = fg;
+      ctx.font = 'bold 22px system-ui, sans-serif';
+      ctx.fillText(line1, x + 12, y + 26);
+      ctx.font = '13px system-ui, sans-serif';
+      ctx.fillText(line2, x + 12, y + 45, w - 24);
+
+      ctx.globalAlpha = 1;
+    }
+
+    function formatPrice({ price, currency = 'EUR' }) {
+      try { return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(price); }
+      catch { return `${price} ${currency}`; }
+    }
+
+    function roundRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    // ---------- UI ----------
+    function setMode(m) {
+      mode = m;
+      tracks.clear();
+      btnCodes.classList.toggle('active', m === 'codes');
+      btnObjects.classList.toggle('active', m === 'objects');
+      log('info', `mode: ${m}`);
+    }
+    btnCodes.onclick = () => setMode('codes');
+    btnObjects.onclick = () => setMode('objects');
+
+    const btnDebug = document.getElementById('debugBtn');
+    function setDebug(on) {
+      debugEl.classList.toggle('open', on);
+      btnDebug.classList.toggle('active', on);
+      debugDirty = true;
+    }
+    btnDebug.onclick = () => setDebug(!debugEl.classList.contains('open'));
+    setDebug(params.has('debug'));
+
+    async function begin(startFn) {
+      document.getElementById('startScreen').remove();
+      try {
+        await startFn();
+      } catch (err) {
+        setStatus(`Video error: ${err.name} – ${err.message}`);
+        log('err', `video error: ${err.name} – ${err.message}`);
+      }
+    }
+
+    document.getElementById('start').onclick = () => begin(startCamera);
+
+    const btnSample = document.getElementById('startSample');
+    if (TEST_VIDEO) {
+      btnSample.hidden = false;
+      btnSample.onclick = () => begin(() => startFile(TEST_VIDEO, TEST_VIDEO));
+    }
+
+    const fileInput = document.getElementById('videoFile');
+    document.getElementById('pickVideo').onclick = () => fileInput.click();
+    fileInput.onchange = () => {
+      const f = fileInput.files[0];
+      if (f) begin(() => startFile(URL.createObjectURL(f), f.name));
+    };
+  </script>
+</body>
+</html>

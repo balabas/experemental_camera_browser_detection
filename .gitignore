@@ -1,0 +1,6 @@
+# local test videos
+sample_video/
+
+# Python
+.venv/
+__pycache__/

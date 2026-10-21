@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera + Location</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #111; color: #eee; }
+    video, canvas, img { width: 100%; max-width: 640px; border-radius: 8px; background: #000; display: block; }
+    button { font-size: 16px; padding: 10px 14px; margin: 8px 8px 8px 0; border-radius: 8px; border: 0; }
+    #status { font-size: 14px; color: #aaa; white-space: pre-line; }
+    #loc { font-family: monospace; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h2>Camera + Location demo</h2>
+
+  <button id="start">Start camera</button>
+  <button id="flip" disabled>Flip camera</button>
+  <button id="snap" disabled>Take photo</button>
+
+  <video id="video" autoplay playsinline muted></video>
+  <div id="loc">Location: waiting…</div>
+  <div id="status"></div>
+
+  <h3>Captured</h3>
+  <img id="photo" alt="">
+
+  <script>
+    const video = document.getElementById('video');
+    const photo = document.getElementById('photo');
+    const locEl = document.getElementById('loc');
+    const statusEl = document.getElementById('status');
+    const btnStart = document.getElementById('start');
+    const btnFlip = document.getElementById('flip');
+    const btnSnap = document.getElementById('snap');
+
+    let stream = null;
+    let facingMode = 'environment'; // back camera on phones
+    let lastPos = null;
+
+    function log(msg) { statusEl.textContent = msg; }
+
+    if (!window.isSecureContext) {
+      log('Not a secure context: camera and location need HTTPS (or http://localhost).');
+    }
+
+    async function startCamera() {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        video.srcObject = stream;
+        btnFlip.disabled = false;
+        btnSnap.disabled = false;
+        const s = stream.getVideoTracks()[0].getSettings();
+        log(`Camera: ${s.width}x${s.height}, facing ${s.facingMode || facingMode}`);
+      } catch (err) {
+        log(`Camera error: ${err.name} – ${err.message}`);
+      }
+    }
+
+    function startLocation() {
+      if (!('geolocation' in navigator)) {
+        locEl.textContent = 'Location: not supported';
+        return;
+      }
+      navigator.geolocation.watchPosition(
+        pos => {
+          lastPos = pos;
+          const { latitude, longitude, accuracy } = pos.coords;
+          locEl.textContent = `Location: ${latitude.toFixed(6)}, ${longitude.toFixed(6)} (±${Math.round(accuracy)} m)`;
+        },
+        err => { locEl.textContent = `Location error: ${err.message}`; },
+        { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+      );
+    }
+
+    function takePhoto() {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0);
+
+      // Stamp time and coordinates onto the photo
+      const text = [
+        new Date().toLocaleString(),
+        lastPos
+          ? `${lastPos.coords.latitude.toFixed(6)}, ${lastPos.coords.longitude.toFixed(6)}`
+          : 'no location',
+      ];
+      const size = Math.max(16, canvas.width / 40);
+      ctx.font = `${size}px sans-serif`;
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(0, canvas.height - size * 2.8, canvas.width, size * 2.8);
+      ctx.fillStyle = '#fff';
+      text.forEach((line, i) => ctx.fillText(line, size / 2, canvas.height - size * (1.6 - i * 1.2)));
+
+      photo.src = canvas.toDataURL('image/jpeg', 0.9);
+    }
+
+    btnStart.onclick = () => { startCamera(); startLocation(); };
+    btnFlip.onclick = () => {
+      facingMode = facingMode === 'environment' ? 'user' : 'environment';
+      startCamera();
+    };
+    btnSnap.onclick = takePhoto;
+  </script>
+</body>
+</html>
